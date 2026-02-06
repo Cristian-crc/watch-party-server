@@ -1,566 +1,548 @@
 const WebSocket = require('ws');
 const http = require('http');
 const url = require('url');
-const mysql = require('mysql2/promise');
-const jwt = require('jsonwebtoken');
-require('dotenv').config();
+const { v4: uuidv4 } = require('uuid');
 
 // ==================== CONFIGURACIÓN ====================
-const PORT = process.env.PORT || 8080;
-const JWT_SECRET = process.env.JWT_SECRET || 'gerges_watch_party_secret_key_2024';
-const DB_CONFIG = {
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASS || '',
-  database: process.env.DB_NAME || 'if0_40890839_gerges',
-  port: process.env.DB_PORT || 3306,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
-};
+const PORT = process.env.PORT || 10000;
 
-// ==================== INICIALIZACIÓN ====================
-const server = http.createServer();
-const wss = new WebSocket.Server({ server });
-
-// Almacenamiento en memoria para mejor rendimiento
+// ==================== ALMACENAMIENTO EN MEMORIA ====================
 const rooms = new Map(); // roomCode -> { roomInfo, participants: Map<userId, ws> }
-const connections = new Map(); // ws -> { userId, roomCode, username }
+const connections = new Map(); // ws -> { userId, roomCode, username, isHost }
+const userSessions = new Map(); // userId -> { username, currentRoom }
 
-// Pool de conexiones a la base de datos
-let dbPool;
-
-// ==================== FUNCIONES DE BASE DE DATOS ====================
-async function initializeDatabase() {
-  try {
-    dbPool = mysql.createPool(DB_CONFIG);
-    console.log('✅ Conexión a la base de datos establecida');
+// ==================== FUNCIONES DE SALAS ====================
+function createRoom(roomCode, roomName, hostUserId, hostUsername, videoId, maxParticipants = 10, isPrivate = false) {
+    const room = {
+        id: uuidv4(),
+        room_code: roomCode,
+        room_name: roomName || `Sala de ${hostUsername}`,
+        host_user_id: hostUserId,
+        host_username: hostUsername,
+        video_id: videoId,
+        max_participants: maxParticipants,
+        is_private: isPrivate,
+        is_active: true,
+        created_at: Date.now(),
+        video_current_time: 0,
+        is_playing: false,
+        participants: new Map(), // userId -> { ws, username, joinedAt, lastSeen, isHost }
+        messages: [],
+        playbackHistory: []
+    };
     
-    // Verificar tablas necesarias
-    await verifyTables();
-  } catch (error) {
-    console.error('❌ Error al conectar con la base de datos:', error.message);
-    process.exit(1);
-  }
+    rooms.set(roomCode, room);
+    return room;
 }
 
-async function verifyTables() {
-  try {
-    // Verificar que exista la tabla watch_parties
-    const [tables] = await dbPool.query(`
-      SELECT TABLE_NAME 
-      FROM INFORMATION_SCHEMA.TABLES 
-      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'watch_parties'
-    `, [DB_CONFIG.database]);
+function getRoom(roomCode) {
+    return rooms.get(roomCode);
+}
+
+function joinRoom(roomCode, userId, username, ws) {
+    const room = rooms.get(roomCode);
+    if (!room) return null;
     
-    if (tables.length === 0) {
-      console.warn('⚠️  La tabla watch_parties no existe. Asegúrate de ejecutar el SQL proporcionado.');
-    } else {
-      console.log('✅ Tabla watch_parties verificada');
+    // Verificar límite de participantes
+    if (room.participants.size >= room.max_participants) {
+        return { error: 'La sala está llena' };
     }
-  } catch (error) {
-    console.error('❌ Error al verificar tablas:', error.message);
-  }
-}
-
-async function getRoomFromDB(roomCode) {
-  try {
-    const [rows] = await dbPool.query(`
-      SELECT wp.*, v.title as video_title, u.username as host_username
-      FROM watch_parties wp
-      LEFT JOIN videos v ON wp.video_id = v.id
-      LEFT JOIN users u ON wp.host_user_id = u.id
-      WHERE wp.room_code = ? AND wp.is_active = 1
-    `, [roomCode]);
     
-    return rows[0] || null;
-  } catch (error) {
-    console.error('Error al obtener sala de la BD:', error);
-    return null;
-  }
-}
-
-async function getUserFromDB(userId) {
-  try {
-    const [rows] = await dbPool.query(`
-      SELECT id, username, email, subscription_type
-      FROM users
-      WHERE id = ? AND is_active = 1
-    `, [userId]);
+    const isHost = room.host_user_id === userId;
+    const participant = {
+        ws,
+        userId,
+        username,
+        joinedAt: Date.now(),
+        lastSeen: Date.now(),
+        isHost
+    };
     
-    return rows[0] || null;
-  } catch (error) {
-    console.error('Error al obtener usuario de la BD:', error);
-    return null;
-  }
+    room.participants.set(userId, participant);
+    return { room, participant, isHost };
 }
 
-async function updateRoomPlayback(roomCode, currentTime, isPlaying) {
-  try {
-    await dbPool.query(`
-      UPDATE watch_parties 
-      SET video_current_time = ?, is_playing = ?, updated_at = NOW()
-      WHERE room_code = ?
-    `, [currentTime, isPlaying ? 1 : 0, roomCode]);
-  } catch (error) {
-    console.error('Error al actualizar estado de reproducción:', error);
-  }
-}
-
-async function saveChatMessage(roomId, userId, message, messageType = 'text') {
-  try {
-    await dbPool.query(`
-      INSERT INTO watch_party_messages (watch_party_id, user_id, message, message_type)
-      VALUES (?, ?, ?, ?)
-    `, [roomId, userId, message, messageType]);
-  } catch (error) {
-    console.error('Error al guardar mensaje de chat:', error);
-  }
-}
-
-async function updateParticipantLastSeen(roomId, userId) {
-  try {
-    await dbPool.query(`
-      UPDATE watch_party_participants 
-      SET last_seen = NOW() 
-      WHERE watch_party_id = ? AND user_id = ?
-    `, [roomId, userId]);
-  } catch (error) {
-    console.error('Error al actualizar last_seen:', error);
-  }
-}
-
-// ==================== FUNCIONES DE AUTENTICACIÓN ====================
-function verifyToken(token) {
-  try {
-    return jwt.verify(token, JWT_SECRET);
-  } catch (error) {
-    return null;
-  }
-}
-
-function generateToken(userData) {
-  return jwt.sign(userData, JWT_SECRET, { expiresIn: '24h' });
+function leaveRoom(roomCode, userId) {
+    const room = rooms.get(roomCode);
+    if (!room) return;
+    
+    room.participants.delete(userId);
+    
+    // Si no hay más participantes, eliminar la sala después de 5 minutos
+    if (room.participants.size === 0) {
+        setTimeout(() => {
+            if (rooms.get(roomCode)?.participants.size === 0) {
+                rooms.delete(roomCode);
+                console.log(`🗑️ Sala ${roomCode} eliminada por inactividad`);
+            }
+        }, 300000); // 5 minutos
+    }
 }
 
 // ==================== MANEJO DE WEBSOCKET ====================
-wss.on('connection', async (ws, req) => {
-  console.log('🔌 Nueva conexión WebSocket');
-  
-  const query = url.parse(req.url, true).query;
-  const roomCode = query.room;
-  const userId = parseInt(query.user);
-  
-  // Validar parámetros
-  if (!roomCode || !userId) {
-    ws.close(1008, 'Parámetros inválidos');
-    return;
-  }
-  
-  // Obtener información de la sala desde la BD
-  const roomInfo = await getRoomFromDB(roomCode);
-  if (!roomInfo) {
-    ws.close(1008, 'Sala no encontrada');
-    return;
-  }
-  
-  // Obtener información del usuario
-  const userInfo = await getUserFromDB(userId);
-  if (!userInfo) {
-    ws.close(1008, 'Usuario no encontrado');
-    return;
-  }
-  
-  // Inicializar sala en memoria si no existe
-  if (!rooms.has(roomCode)) {
-    rooms.set(roomCode, {
-      info: roomInfo,
-      participants: new Map(),
-      messages: [],
-      lastActivity: Date.now()
-    });
-  }
-  
-  const room = rooms.get(roomCode);
-  
-  // Verificar límite de participantes
-  if (room.participants.size >= roomInfo.max_participants) {
-    ws.close(1008, 'La sala está llena');
-    return;
-  }
-  
-  // Agregar participante a la sala
-  const participantData = {
-    ws,
-    userId,
-    username: userInfo.username,
-    joinedAt: Date.now(),
-    lastSeen: Date.now()
-  };
-  
-  room.participants.set(userId, participantData);
-  connections.set(ws, { userId, roomCode, username: userInfo.username });
-  
-  console.log(`👤 ${userInfo.username} se unió a la sala ${roomCode} (${room.participants.size}/${roomInfo.max_participants})`);
-  
-  // Actualizar last_seen en BD
-  await updateParticipantLastSeen(roomInfo.id, userId);
-  
-  // Enviar información de la sala al nuevo participante
-  ws.send(JSON.stringify({
-    type: 'room_info',
-    room: roomInfo,
-    user: {
-      id: userId,
-      username: userInfo.username,
-      isHost: roomInfo.host_user_id === userId
+const server = http.createServer((req, res) => {
+    // Endpoint de salud para Render
+    if (req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+            status: 'ok', 
+            rooms: rooms.size,
+            connections: connections.size 
+        }));
+        return;
     }
-  }));
-  
-  // Notificar a todos sobre el nuevo participante
-  broadcastToRoom(roomCode, {
-    type: 'participants_update',
-    participants: Array.from(room.participants.values()).map(p => ({
-      user_id: p.userId,
-      username: p.username,
-      last_seen: p.lastSeen
-    }))
-  }, ws);
-  
-  // Enviar mensajes recientes del chat
-  if (room.messages.length > 0) {
-    const recentMessages = room.messages.slice(-50); // Últimos 50 mensajes
-    ws.send(JSON.stringify({
-      type: 'chat_history',
-      messages: recentMessages
-    }));
-  }
-  
-  // Manejar mensajes entrantes
-  ws.on('message', async (data) => {
-    try {
-      const message = JSON.parse(data.toString());
-      await handleMessage(ws, roomCode, userId, message);
-    } catch (error) {
-      console.error('❌ Error al procesar mensaje:', error);
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: 'Error al procesar el mensaje'
-      }));
-    }
-  });
-  
-  // Manejar cierre de conexión
-  ws.on('close', async () => {
-    console.log(`👋 ${userInfo.username} abandonó la sala ${roomCode}`);
     
-    const connectionInfo = connections.get(ws);
-    if (connectionInfo) {
-      const { roomCode, userId, username } = connectionInfo;
-      
-      // Remover de la sala en memoria
-      if (rooms.has(roomCode)) {
-        const room = rooms.get(roomCode);
-        room.participants.delete(userId);
+    // Endpoint para obtener información de salas públicas
+    if (req.url === '/public-rooms') {
+        const publicRooms = Array.from(rooms.values())
+            .filter(room => !room.is_private && room.participants.size > 0)
+            .map(room => ({
+                room_code: room.room_code,
+                room_name: room.room_name,
+                host_username: room.host_username,
+                participant_count: room.participants.size,
+                max_participants: room.max_participants,
+                video_id: room.video_id,
+                created_at: room.created_at
+            }));
         
-        // Si la sala queda vacía, limpiarla después de un tiempo
-        if (room.participants.size === 0) {
-          setTimeout(() => {
-            if (rooms.has(roomCode) && rooms.get(roomCode).participants.size === 0) {
-              rooms.delete(roomCode);
-              console.log(`🗑️  Sala ${roomCode} eliminada de memoria (vacía)`);
-            }
-          }, 300000); // 5 minutos
-        } else {
-          // Notificar a los demás sobre la salida
-          broadcastToRoom(roomCode, {
-            type: 'system_message',
-            message: `${username} ha abandonado la sala`
-          });
-          
-          // Actualizar lista de participantes
-          broadcastToRoom(roomCode, {
-            type: 'participants_update',
-            participants: Array.from(room.participants.values()).map(p => ({
-              user_id: p.userId,
-              username: p.username,
-              last_seen: p.lastSeen
-            }))
-          });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ success: true, rooms: publicRooms }));
+        return;
+    }
+    
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
+});
+
+const wss = new WebSocket.Server({ server, path: '/watch-party' });
+
+wss.on('connection', (ws, req) => {
+    console.log('🔌 Nueva conexión WebSocket');
+    
+    const query = url.parse(req.url, true).query;
+    const roomCode = query.room;
+    const userId = query.user;
+    const username = query.username || 'Usuario';
+    
+    if (!roomCode || !userId) {
+        ws.close(1008, 'Parámetros inválidos: se requieren room y user');
+        return;
+    }
+    
+    // Registrar conexión
+    connections.set(ws, { roomCode, userId, username });
+    
+    // Manejar mensajes
+    ws.on('message', async (data) => {
+        try {
+            const message = JSON.parse(data.toString());
+            await handleMessage(ws, roomCode, userId, username, message);
+        } catch (error) {
+            console.error('❌ Error al procesar mensaje:', error);
+            ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Error al procesar el mensaje'
+            }));
         }
-      }
-      
-      connections.delete(ws);
-    }
-  });
-  
-  // Manejar errores
-  ws.on('error', (error) => {
-    console.error('❌ Error en WebSocket:', error);
-  });
-  
-  // Enviar ping periódico para mantener conexión activa
-  const pingInterval = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.ping();
-    } else {
-      clearInterval(pingInterval);
-    }
-  }, 30000); // Cada 30 segundos
-  
-  ws.on('pong', () => {
-    // Actualizar lastSeen del participante
-    if (rooms.has(roomCode)) {
-      const room = rooms.get(roomCode);
-      if (room.participants.has(userId)) {
-        room.participants.get(userId).lastSeen = Date.now();
-        updateParticipantLastSeen(roomInfo.id, userId);
-      }
-    }
-  });
+    });
+    
+    // Manejar cierre
+    ws.on('close', () => {
+        console.log(`👋 ${username} (${userId}) desconectado`);
+        const connectionInfo = connections.get(ws);
+        if (connectionInfo) {
+            leaveRoom(connectionInfo.roomCode, userId);
+            connections.delete(ws);
+            
+            // Notificar a los demás participantes
+            const room = getRoom(connectionInfo.roomCode);
+            if (room) {
+                broadcastToRoom(room.room_code, {
+                    type: 'user_left',
+                    user_id: userId,
+                    username: username,
+                    timestamp: Date.now()
+                }, ws);
+                
+                // Actualizar lista de participantes
+                broadcastToRoom(room.room_code, {
+                    type: 'participants_update',
+                    participants: getRoomParticipants(room.room_code)
+                });
+            }
+        }
+    });
+    
+    // Manejar errores
+    ws.on('error', (error) => {
+        console.error('❌ Error en WebSocket:', error);
+    });
+    
+    // Enviar confirmación de conexión
+    ws.send(JSON.stringify({
+        type: 'connected',
+        message: 'Conectado al servidor Watch Party',
+        room: roomCode,
+        user: { id: userId, username }
+    }));
 });
 
 // ==================== MANEJO DE MENSAJES ====================
-async function handleMessage(ws, roomCode, userId, message) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  
-  const participant = room.participants.get(userId);
-  if (!participant) return;
-  
-  participant.lastSeen = Date.now();
-  room.lastActivity = Date.now();
-  
-  switch (message.type) {
-    case 'chat_message':
-      await handleChatMessage(roomCode, userId, participant.username, message);
-      break;
-      
-    case 'playback_update':
-      await handlePlaybackUpdate(roomCode, userId, participant.username, message);
-      break;
-      
-    case 'system_message':
-      handleSystemMessage(roomCode, message);
-      break;
-      
-    case 'invitation_update':
-      handleInvitationUpdate(roomCode, message);
-      break;
-      
-    case 'user_action':
-      handleUserAction(roomCode, userId, participant.username, message);
-      break;
-      
-    default:
-      console.warn(`⚠️  Tipo de mensaje desconocido: ${message.type}`);
-  }
+async function handleMessage(ws, roomCode, userId, username, message) {
+    console.log(`📨 Mensaje de ${username} (${userId}) en ${roomCode}: ${message.type}`);
+    
+    switch (message.type) {
+        case 'join':
+            await handleJoin(ws, roomCode, userId, username, message);
+            break;
+            
+        case 'chat_message':
+            await handleChatMessage(roomCode, userId, username, message);
+            break;
+            
+        case 'playback_update':
+            await handlePlaybackUpdate(roomCode, userId, username, message);
+            break;
+            
+        case 'participants_request':
+            handleParticipantsRequest(ws, roomCode);
+            break;
+            
+        case 'invite_user':
+            await handleInviteUser(roomCode, userId, username, message);
+            break;
+            
+        case 'remove_participant':
+            await handleRemoveParticipant(roomCode, userId, message);
+            break;
+            
+        case 'promote_to_cohost':
+            await handlePromoteToCohost(roomCode, userId, message);
+            break;
+            
+        case 'sync_request':
+            handleSyncRequest(ws, roomCode);
+            break;
+            
+        default:
+            console.warn(`⚠️ Tipo de mensaje desconocido: ${message.type}`);
+    }
+}
+
+async function handleJoin(ws, roomCode, userId, username, message) {
+    let room = getRoom(roomCode);
+    let isHost = false;
+    
+    // Si la sala no existe, crearla
+    if (!room) {
+        if (message.create) {
+            room = createRoom(
+                roomCode,
+                message.room_name,
+                userId,
+                username,
+                message.video_id,
+                message.max_participants || 10,
+                message.is_private || false
+            );
+            isHost = true;
+            console.log(`🎉 Sala ${roomCode} creada por ${username}`);
+        } else {
+            ws.send(JSON.stringify({
+                type: 'error',
+                message: 'La sala no existe'
+            }));
+            return;
+        }
+    }
+    
+    // Unirse a la sala
+    const joinResult = joinRoom(roomCode, userId, username, ws);
+    if (joinResult.error) {
+        ws.send(JSON.stringify({
+            type: 'error',
+            message: joinResult.error
+        }));
+        return;
+    }
+    
+    // Actualizar conexión con información de la sala
+    const connectionInfo = connections.get(ws);
+    if (connectionInfo) {
+        connectionInfo.isHost = isHost || joinResult.isHost;
+    }
+    
+    // Enviar información de la sala al nuevo participante
+    ws.send(JSON.stringify({
+        type: 'room_joined',
+        room: {
+            room_code: room.room_code,
+            room_name: room.room_name,
+            host_user_id: room.host_user_id,
+            host_username: room.host_username,
+            video_id: room.video_id,
+            max_participants: room.max_participants,
+            is_private: room.is_private,
+            video_current_time: room.video_current_time,
+            is_playing: room.is_playing,
+            created_at: room.created_at
+        },
+        user: {
+            id: userId,
+            username: username,
+            isHost: isHost || joinResult.isHost
+        }
+    }));
+    
+    // Notificar a todos sobre el nuevo participante
+    broadcastToRoom(roomCode, {
+        type: 'user_joined',
+        user_id: userId,
+        username: username,
+        isHost: isHost || joinResult.isHost,
+        timestamp: Date.now()
+    }, ws);
+    
+    // Enviar lista actualizada de participantes
+    broadcastToRoom(roomCode, {
+        type: 'participants_update',
+        participants: getRoomParticipants(roomCode)
+    });
+    
+    // Enviar historial del chat
+    if (room.messages.length > 0) {
+        ws.send(JSON.stringify({
+            type: 'chat_history',
+            messages: room.messages.slice(-50)
+        }));
+    }
+    
+    // Enviar historial de reproducción
+    if (room.playbackHistory.length > 0) {
+        const lastPlayback = room.playbackHistory[room.playbackHistory.length - 1];
+        ws.send(JSON.stringify({
+            type: 'playback_sync',
+            current_time: lastPlayback.current_time,
+            is_playing: lastPlayback.is_playing,
+            timestamp: lastPlayback.timestamp
+        }));
+    }
 }
 
 async function handleChatMessage(roomCode, userId, username, message) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  
-  const chatMessage = {
-    type: 'chat_message',
-    user_id: userId,
-    username: username,
-    message: message.content,
-    timestamp: Date.now()
-  };
-  
-  // Guardar en memoria (máximo 100 mensajes)
-  room.messages.push(chatMessage);
-  if (room.messages.length > 100) {
-    room.messages = room.messages.slice(-100);
-  }
-  
-  // Guardar en base de datos
-  await saveChatMessage(room.info.id, userId, message.content);
-  
-  // Transmitir a todos en la sala
-  broadcastToRoom(roomCode, chatMessage);
+    const room = getRoom(roomCode);
+    if (!room) return;
+    
+    const chatMessage = {
+        type: 'chat_message',
+        user_id: userId,
+        username: username,
+        message: message.content,
+        timestamp: Date.now()
+    };
+    
+    // Guardar en memoria (máximo 100 mensajes)
+    room.messages.push(chatMessage);
+    if (room.messages.length > 100) {
+        room.messages = room.messages.slice(-100);
+    }
+    
+    // Transmitir a todos en la sala
+    broadcastToRoom(roomCode, chatMessage);
 }
 
 async function handlePlaybackUpdate(roomCode, userId, username, message) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  
-  // Actualizar estado en memoria
-  room.info.video_current_time = message.current_time;
-  room.info.is_playing = message.is_playing;
-  
-  // Actualizar en base de datos
-  await updateRoomPlayback(roomCode, message.current_time, message.is_playing);
-  
-  // Transmitir a todos excepto al remitente
-  broadcastToRoom(roomCode, {
-    type: 'playback_update',
-    user_id: userId,
-    username: username,
-    event_type: message.event_type,
-    current_time: message.current_time,
-    is_playing: message.is_playing,
-    timestamp: Date.now()
-  }, userId);
+    const room = getRoom(roomCode);
+    if (!room) return;
+    
+    // Actualizar estado de la sala
+    room.video_current_time = message.current_time;
+    room.is_playing = message.is_playing;
+    
+    // Guardar en historial (máximo 50 entradas)
+    room.playbackHistory.push({
+        user_id: userId,
+        current_time: message.current_time,
+        is_playing: message.is_playing,
+        timestamp: Date.now()
+    });
+    
+    if (room.playbackHistory.length > 50) {
+        room.playbackHistory = room.playbackHistory.slice(-50);
+    }
+    
+    // Transmitir a todos excepto al remitente
+    broadcastToRoom(roomCode, {
+        type: 'playback_update',
+        user_id: userId,
+        username: username,
+        event_type: message.event_type,
+        current_time: message.current_time,
+        is_playing: message.is_playing,
+        timestamp: Date.now()
+    }, userId);
 }
 
-function handleSystemMessage(roomCode, message) {
-  broadcastToRoom(roomCode, {
-    type: 'system_message',
-    message: message.content,
-    timestamp: Date.now()
-  });
+function handleParticipantsRequest(ws, roomCode) {
+    const participants = getRoomParticipants(roomCode);
+    ws.send(JSON.stringify({
+        type: 'participants_list',
+        participants: participants
+    }));
 }
 
-function handleInvitationUpdate(roomCode, message) {
-  broadcastToRoom(roomCode, {
-    type: 'invitation_update',
-    ...message,
-    timestamp: Date.now()
-  });
-}
-
-function handleUserAction(roomCode, userId, username, message) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  
-  // Verificar si el usuario es el host
-  const isHost = room.info.host_user_id === userId;
-  
-  switch (message.action) {
-    case 'remove_participant':
-      if (isHost && message.target_user_id !== userId) {
-        // Encontrar y cerrar conexión del usuario objetivo
-        const targetParticipant = room.participants.get(message.target_user_id);
-        if (targetParticipant && targetParticipant.ws.readyState === WebSocket.OPEN) {
-          targetParticipant.ws.close(1000, 'Removido por el anfitrión');
-        }
+async function handleInviteUser(roomCode, userId, username, message) {
+    const room = getRoom(roomCode);
+    if (!room) return;
+    
+    // Verificar si el usuario es el host
+    const participant = room.participants.get(userId);
+    if (!participant?.isHost) {
+        // Solo el host puede invitar
+        const connection = Array.from(connections.values())
+            .find(conn => conn.userId === userId && conn.roomCode === roomCode);
         
-        // Notificar a todos
+        if (connection?.ws) {
+            connection.ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Solo el anfitrión puede invitar usuarios'
+            }));
+        }
+        return;
+    }
+    
+    // Notificar a todos sobre la invitación
+    broadcastToRoom(roomCode, {
+        type: 'invitation_sent',
+        from_user_id: userId,
+        from_username: username,
+        invitee: message.invitee,
+        timestamp: Date.now()
+    });
+}
+
+async function handleRemoveParticipant(roomCode, userId, message) {
+    const room = getRoom(roomCode);
+    if (!room || !message.target_user_id) return;
+    
+    // Verificar si el usuario es el host
+    const remover = room.participants.get(userId);
+    if (!remover?.isHost) return;
+    
+    // Encontrar y cerrar conexión del usuario objetivo
+    const targetParticipant = room.participants.get(message.target_user_id);
+    if (targetParticipant && targetParticipant.ws.readyState === WebSocket.OPEN) {
+        targetParticipant.ws.close(1000, 'Removido por el anfitrión');
+    }
+    
+    // Notificar a todos
+    broadcastToRoom(roomCode, {
+        type: 'system_message',
+        message: `El anfitrión ha removido a un participante`,
+        timestamp: Date.now()
+    });
+}
+
+async function handlePromoteToCohost(roomCode, userId, message) {
+    const room = getRoom(roomCode);
+    if (!room || !message.target_user_id) return;
+    
+    // Verificar si el usuario es el host
+    const promoter = room.participants.get(userId);
+    if (!promoter?.isHost) return;
+    
+    // Encontrar al usuario objetivo
+    const targetParticipant = room.participants.get(message.target_user_id);
+    if (targetParticipant) {
+        // En este sistema simple, marcamos como co-host en el mensaje
         broadcastToRoom(roomCode, {
-          type: 'system_message',
-          message: `El anfitrión ha removido a un participante`
+            type: 'system_message',
+            message: `${targetParticipant.username} ha sido promovido a co-anfitrión`,
+            timestamp: Date.now()
         });
-      }
-      break;
-      
-    case 'promote_to_cohost':
-      if (isHost) {
-        broadcastToRoom(roomCode, {
-          type: 'system_message',
-          message: `${username} ha sido promovido a co-anfitrión`
-        });
-      }
-      break;
-      
-    case 'transfer_host':
-      if (isHost) {
-        room.info.host_user_id = message.new_host_id;
-        broadcastToRoom(roomCode, {
-          type: 'system_message',
-          message: `El anfitrión ha sido transferido`
-        });
-      }
-      break;
-  }
+    }
+}
+
+function handleSyncRequest(ws, roomCode) {
+    const room = getRoom(roomCode);
+    if (!room) return;
+    
+    ws.send(JSON.stringify({
+        type: 'playback_sync',
+        current_time: room.video_current_time,
+        is_playing: room.is_playing,
+        timestamp: Date.now()
+    }));
 }
 
 // ==================== FUNCIONES AUXILIARES ====================
-function broadcastToRoom(roomCode, message, excludeUserId = null) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  
-  const messageStr = JSON.stringify(message);
-  
-  room.participants.forEach((participant, userId) => {
-    if (userId !== excludeUserId && participant.ws.readyState === WebSocket.OPEN) {
-      participant.ws.send(messageStr);
-    }
-  });
+function getRoomParticipants(roomCode) {
+    const room = getRoom(roomCode);
+    if (!room) return [];
+    
+    return Array.from(room.participants.values()).map(p => ({
+        user_id: p.userId,
+        username: p.username,
+        isHost: p.isHost,
+        last_seen: p.lastSeen,
+        joined_at: p.joinedAt
+    }));
 }
 
-function getRoomParticipants(roomCode) {
-  const room = rooms.get(roomCode);
-  if (!room) return [];
-  
-  return Array.from(room.participants.values()).map(p => ({
-    user_id: p.userId,
-    username: p.username,
-    last_seen: p.lastSeen
-  }));
+function broadcastToRoom(roomCode, message, excludeUserId = null) {
+    const room = getRoom(roomCode);
+    if (!room) return;
+    
+    const messageStr = JSON.stringify(message);
+    
+    room.participants.forEach((participant, userId) => {
+        if (userId !== excludeUserId && participant.ws.readyState === WebSocket.OPEN) {
+            participant.ws.send(messageStr);
+        }
+    });
 }
 
 // ==================== LIMPIEZA PERIÓDICA ====================
 setInterval(() => {
-  const now = Date.now();
-  const inactiveThreshold = 5 * 60 * 1000; // 5 minutos
-  
-  rooms.forEach((room, roomCode) => {
-    // Remover participantes inactivos
-    room.participants.forEach((participant, userId) => {
-      if (now - participant.lastSeen > inactiveThreshold) {
-        console.log(`⏰ Removiendo participante inactivo: ${participant.username}`);
-        if (participant.ws.readyState === WebSocket.OPEN) {
-          participant.ws.close(1000, 'Inactivo por mucho tiempo');
+    const now = Date.now();
+    const inactiveThreshold = 5 * 60 * 1000; // 5 minutos
+    
+    // Limpiar conexiones inactivas
+    connections.forEach((conn, ws) => {
+        if (ws.readyState !== WebSocket.OPEN) {
+            connections.delete(ws);
         }
-        room.participants.delete(userId);
-      }
     });
     
-    // Si la sala está vacía por mucho tiempo, limpiarla
-    if (room.participants.size === 0 && now - room.lastActivity > inactiveThreshold) {
-      rooms.delete(roomCode);
-      console.log(`🗑️  Sala ${roomCode} eliminada por inactividad`);
-    }
-  });
-}, 60000); // Ejecutar cada minuto
+    // Limpiar salas vacías
+    rooms.forEach((room, roomCode) => {
+        if (room.participants.size === 0 && now - room.created_at > inactiveThreshold) {
+            rooms.delete(roomCode);
+            console.log(`🗑️ Sala ${roomCode} eliminada por inactividad`);
+        }
+    });
+}, 60000); // Cada minuto
 
 // ==================== INICIALIZACIÓN DEL SERVIDOR ====================
-async function startServer() {
-  try {
-    await initializeDatabase();
-    
-    server.listen(PORT, () => {
-      console.log(`🚀 Servidor WebSocket iniciado en el puerto ${PORT}`);
-      console.log(`🔗 URL del servidor: ws://localhost:${PORT}`);
-      console.log(`📊 Salas activas en memoria: ${rooms.size}`);
-      console.log(`💾 Base de datos: ${DB_CONFIG.database}@${DB_CONFIG.host}`);
-    });
-  } catch (error) {
-    console.error('❌ Error al iniciar el servidor:', error);
-    process.exit(1);
-  }
-}
+server.listen(PORT, () => {
+    console.log(`🚀 Servidor WebSocket iniciado en el puerto ${PORT}`);
+    console.log(`🔗 URL del servidor: ws://localhost:${PORT}/watch-party`);
+    console.log(`📊 Salas activas en memoria: ${rooms.size}`);
+    console.log(`🏥 Endpoint de salud: http://localhost:${PORT}/health`);
+    console.log(`🌐 Endpoint salas públicas: http://localhost:${PORT}/public-rooms`);
+});
 
 // Manejar cierre limpio
 process.on('SIGINT', () => {
-  console.log('\n👋 Apagando servidor...');
-  
-  // Cerrar todas las conexiones WebSocket
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.close(1000, 'Servidor apagándose');
-    }
-  });
-  
-  // Cerrar pool de base de datos
-  if (dbPool) {
-    dbPool.end();
-  }
-  
-  process.exit(0);
+    console.log('\n👋 Apagando servidor...');
+    
+    // Cerrar todas las conexiones WebSocket
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.close(1000, 'Servidor apagándose');
+        }
+    });
+    
+    process.exit(0);
 });
-
-// Iniciar servidor
-startServer();
-
-// Exportar para pruebas
-module.exports = {
-  server,
-  wss,
-  rooms,
-  connections,
-  broadcastToRoom,
-  getRoomParticipants
-};
